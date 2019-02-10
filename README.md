@@ -32,4 +32,9 @@ architecture.
 
 - @withzombie's [bnil-graph](https://github.com/withzombies/bnil-graph) is useful for debugging LILL.
 
+- Amy Burnett's [Untangling Exotic Architectures with Binary 
+Ninja](https://blog.ret2.io/2017/10/17/untangling-exotic-architectures-with-binary-ninja/) was also a useful reference.
+
+- [The Binary Ninja API documentation](https://api.binary.ninja/) is a must too.
+
 - The Binary Ninja slack is helpful for asking questions about the API.
