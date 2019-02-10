@@ -1,15 +1,18 @@
 from binascii import hexlify
 from binaryninja.binaryview import BinaryViewType
 from binaryninja.architecture import Architecture
-from binaryninja.function import RegisterInfo, InstructionInfo, InstructionTextToken
+from binaryninja.function import RegisterInfo, InstructionInfo, InstructionTextToken, IntrinsicInfo
 from binaryninja.enums import (Endianness, ImplicitRegisterExtend, BranchType,
         InstructionTextTokenType, LowLevelILFlagCondition, FlagRole)
 from binaryninja.enums import LowLevelILOperation, LowLevelILFlagCondition, InstructionTextTokenType
 from binaryninja.lowlevelil import LowLevelILLabel
 from binaryninja.functionrecognizer import FunctionRecognizer
 from binaryninja.callingconvention import CallingConvention
+import binaryninja.log as log
 import r2pipe
 import threading
+from collections import namedtuple
+
 
 # Helper function to make tokens easier to make
 def makeToken(tokenType, text, data=None):
@@ -26,6 +29,32 @@ def makeToken(tokenType, text, data=None):
         return InstructionTextToken(tokenType, text)
     return InstructionTextToken(tokenType, text, data)
 
+# This class duck types as an LowLevelILFunction
+# but only implements methods necessary to
+# perform "goto"
+#
+# It's used to emulate an ESIL branch to see
+# if it only generates a simple 'goto' in which
+# case it is inlined instead of creating a separate
+# label and block
+class ThreaderILDuck(object):
+	def __init__(self):
+		self.target = None
+	def append(self, instruction):
+		pass
+	def goto(self, label):
+		self.target = label
+	def __getitem__(self, key):
+		instructionduck = type('', (), {
+			"operation": LowLevelILOperation.LLIL_CONST,
+			"operands": [key]
+		})()
+		return instructionduck
+	def const(self, size, n):
+		return n
+	def get_label_for_address(self, arch, target):
+		return target
+
 # LittleEndian Xtensa
 class XtensaLE(Architecture):
         name = "Xtensa LE"
@@ -34,6 +63,10 @@ class XtensaLE(Architecture):
         default_int_size = 4
         instr_alignment = 1
         max_instr_length = 3
+
+	# Include extra useless garbage in the LLIL
+	# and also dump ESIL in the instruction
+	VERBOSE_IL = False
 
 	regs = {
 		"pc": RegisterInfo("pc", 4),
@@ -50,6 +83,11 @@ class XtensaLE(Architecture):
 	for i in range(16):
 		n = "a{0}".format(i)
 		regs[n] = RegisterInfo(n, 4)
+
+	intrinsics = {
+		"memw": IntrinsicInfo([], []),
+		"entry": IntrinsicInfo([], []),
+	}
 
 	_branch_instrs = ["bbci", "bbsi", "bgeu", "bltu", "bany", "bnone", "ball", "bnall", "bbc", "bbs"]
 	for operand in ["z", "i", "ui", ""]:
@@ -147,7 +185,28 @@ class XtensaLE(Architecture):
 				tokens.append(makeToken("int", arg))
 			else:
 				tokens.append(makeToken("reg", arg))
+
+		if self.VERBOSE_IL:
+			esil = self._get_esil(data, addr)
+			tokens.append(makeToken("sep", "    "))
+			tokens.append(makeToken("text", "esil='"+esil+"'"))
+
 		return tokens, self._inst_length(inst)
+	def force_label(self, il, a):
+		t = il.get_label_for_address(self, a)
+		if t is None:
+			t = il.add_label_for_address(self, a)
+			if t is None:
+				return self.force_label(il, a)
+		return t
+
+	def goto_or_jmp(self, il, a):
+		t = self.force_label(il, a)
+		if t is None:
+			il.append(il.jump(il.const(4, a)))
+		else:
+			il.append(il.goto(t))
+
 	def get_instruction_low_level_il(self, data, addr, il):
 		locals = threading.local()
 		inst,args = self._get_asm(data, addr)
@@ -155,24 +214,11 @@ class XtensaLE(Architecture):
 			return None
 		l = self._inst_length(inst)
 
-		def force_label(a):
-			t = il.get_label_for_address(self, a)
-			if t is None:
-				t = il.add_label_for_address(self, a)
-				return force_label(a)
-			return t
-		def goto_or_jmp(a):
-			t = force_label(a)
-			if t is None:
-				il.append(il.jump(il.const(4, a)))
-			else:
-				il.append(il.goto(t))
-
 		if inst in ("jx"):
 			if args[0] in self.regs:
 				il.append(il.jump(il.reg(4, args[0])))
 			else:
-				goto_or_jmp(int(args[0], 16))
+				self.goto_or_jmp(il, int(args[0], 16))
 			return l
 		elif inst.startswith("call"):
 			spilled_regs = int(inst[5 if inst.startswith("callx") else 4:])
@@ -184,7 +230,7 @@ class XtensaLE(Architecture):
 #					il.append(il.push(4, r(i)))
 #				for i in range(spilled_regs, 16):
 #					il.append(il.set_reg(4, a(i-spilled_regs), r(i)))
-			if spilled_regs != 0:
+			if spilled_regs != 0 and self.VERBOSE_IL:
 				il.append(il.set_reg(1, "PS.CALLINC", il.const(1, spilled_regs)))
 			# return address
 #			il.append(il.set_reg(4, a(spilled_regs), il.const(4, addr + l)))
@@ -201,7 +247,7 @@ class XtensaLE(Architecture):
 			il.append(il.ret(il.reg(4, "a0")))
 			return l
 		elif inst == "j":
-			goto_or_jmp(int(args[0], 16))
+			il.append(il.jump(il.const(4, int(args[0], 16))))
 			return l
 		elif inst in ("loopgtz", "loopnez", "loop"):
 			lbegin = addr + l
@@ -209,34 +255,87 @@ class XtensaLE(Architecture):
 			r = il.reg(4, args[0])
 			lcount = il.sub(4, r, il.const(4,1))
 			# lend must come before lbegin for loop detection to work lower down
-			il.append(il.set_reg(4, "lend", il.const(4, lend)))
-			il.append(il.set_reg(4, "lbegin", il.const(4, lbegin)))
-			il.append(il.set_reg(4, "lcount", lcount))
+			if self.VERBOSE_IL:
+				il.append(il.set_reg(4, "lend", il.const(4, lend)))
+				il.append(il.set_reg(4, "lbegin", il.const(4, lbegin)))
+				il.append(il.set_reg(4, "lcount", lcount))
 			if inst in ("loopgtz", "loopnez"):
-				t = force_label(lbegin)
-				f = force_label(lend)
+				t = self.force_label(il, lbegin)
+				f = self.force_label(il, lend)
+				set_t = False
+				set_f = False
+				if t is None:
+					set_t = True
+					t = LowLevelILLabel()
+				if f is None:
+					set_f = True
+					f = LowLevelILLabel()
 				if inst == "loopnez":
 					cond = il.compare_unsigned_greater_equal(4, r, il.const(4, 0))
 				else:
 					cond = il.compare_signed_greater_equal(4, r, il.const(4, 0))
 				il.append(il.if_expr(cond, t, f))
+				if set_f:
+					il.mark_label(f)
+					self.goto_or_jmp(il, lend)
+				if set_t:
+					il.mark_label(t)
+					# fallthrough
+
 			with self._looplock:
 				self.loops[lend] = lbegin
 			return l
 		elif inst == "entry":
 			# Entry doesn't *do* anything, basically
+			il.append(il.intrinsic([], "entry", []))
 			return l
-
+		elif inst == "memw":
+			il.append(il.intrinsic([], "memw", []))
+			return l
 		esil = self._get_esil(data[0:l], addr)
 		if esil == "":
 			il.append(il.unimplemented())
 			return l
+		parts = esil.split(",")
 
 		# For basic instructions, interpret the ESIL
-		parts = esil.split(",")
+		self.esil_to_llil(inst, parts, il, addr, l)
+
+		# Scan the function for loop instructions pointing to here
+		lbegin = None
+		with self._looplock:
+			n = addr + l
+			if n in self.loops:
+				lbegin = self.loops[n]
+		if lbegin is not None:
+			cond = il.compare_unsigned_greater_than(4, il.reg(4, "lcount"), il.const(4, 0))
+			f = self.force_label(il, n)
+			t = self.force_label(il, lbegin) #il.get_label_for_address(self, lbegin)
+			set_f = False
+			set_t = False
+			if f is None:
+				set_f = True
+				f = LowLevelILLabel()
+			if t is None:
+				set_t = True
+				t = LowLevelILLabel()
+
+			il.append(il.if_expr(cond, t, f))
+			if set_t:
+				il.mark_label(t)
+				self.goto_or_jmp(il, lbegin)
+			if set_f:
+				il.mark_label(f)
+				# fallthrough
+		return l
+
+	# Implement a basic stack machine to translate ESIL to LLIL
+	def esil_to_llil(self, inst, parts, il, addr, l):
 		stack = []
 		label_stack = []
-		# pop for reading
+		skip_to_close = False
+		# pop for reading - interprets the PC register as
+		# the value of the next instruction
 		def popr():
 			r = stack.pop()
 			if r == "pc":
@@ -246,6 +345,7 @@ class XtensaLE(Architecture):
 			# No idea why I need this
 			if token == "" and i == len(parts)-1:
 				break
+			if skip_to_close and token != "}": continue
 			if token == "$$":
 				stack.append(il.const(4, addr))
 				continue
@@ -272,7 +372,7 @@ class XtensaLE(Architecture):
 				if dst == "pc":
 					srci = il[src]
 					if srci.operation == LowLevelILOperation.LLIL_CONST:
-						goto_or_jmp(srci.operands[0])
+						self.goto_or_jmp(il, srci.operands[0])
 						continue
 					il.append(il.jump(src))
 					continue
@@ -287,10 +387,23 @@ class XtensaLE(Architecture):
 				if dste == "pc":
 					srci = il[src]
 					# Note in ESIL this is w.r.t. the *next* address
+					# For narrow branch instructions, it calculates the pc relative
+					# wrong in the ESIL and uses 3 bytes anyway
+					# also, srci.operands[0] is 8 bytes *signed* but ESIL
+					# doesn't seem to reflect this?
+					# Note: except beqz, bnez, bgez, bltz which have 12 bytes *signed*
+					# and beqz.n and bnez.n which are 4 bytes unsigned
 					if srci.operation == LowLevelILOperation.LLIL_CONST:
-						goto_or_jmp(srci.operands[0] + addr + l)
+						offset = srci.operands[0]
+						if inst in ("beqz", "bnez", "bgez", "bltz"):
+							if offset > (1 << 11) - 1:
+								offset = ((1<<12)-offset) * -1
+						elif inst in ("beqz.n", "bnez.n"): pass
+						elif offset > 127:
+							offset = (256-offset) * -1
+						self.goto_or_jmp(il, offset + addr + 3)
 					else:
-						il.append(il.jump(il.add(4, il.const(4, addr + l), src)))
+						il.append(il.jump(il.add(4, il.const(4, addr + 3), src)))
 					continue
 				dst = il[dste]
 				if dst.operation != LowLevelILOperation.LLIL_REG:
@@ -331,40 +444,59 @@ class XtensaLE(Architecture):
 
 			# Hack to support branch instructions
 			if token == "?{":
-				t = LowLevelILLabel()
-				end = parts[i+1:].index("}")
+				t = None
+				set_t = False
+				end = parts.index("}", i+1)
 
 				f = None
+				# Don't create useless labels if this is at the end
+				# of the instruction (e.g. a branch)
 				if end == len(parts)-1:
-					f = force_label(addr+l)
+					f = self.force_label(il, addr+l)
 				if f is None:
 					f = LowLevelILLabel()
 					label_stack.append(f)
 
+				inner = parts[i+1:end]
+
+				fakeil = ThreaderILDuck()
+				try:
+					self.esil_to_llil(inst, inner, fakeil, addr, l)
+				except AttributeError as e:
+					pass
+				except IndexError as e: # Tried to access the stack outside! Bad!
+					pass
+				except Exception as e:
+					log.log_error("{0} {1}".format(e, inner))
+					raise e
+				else:
+					if fakeil.target is not None:
+						t = self.force_label(il, fakeil.target)
+#						log.log_info("Prediction successful at {0:X}, {1}, {2:X} {3} {4}".format(addr, inner, fakeil.target, t, parts))
+#					else:
+#						log.log_warn("Prediction succesful but no target {0} {1}".format(inner, parts))
+
+				if t is None:
+					set_t = True
+					t = LowLevelILLabel()
+
 				il.append(il.if_expr(stack.pop(), t, f))
-				il.mark_label(t)
+				if set_t:
+					il.mark_label(t)
+				elif len(label_stack) == 0:
+					break
+				else:
+					skip_to_close = True
 				continue
 
 			if token == "}":
 				if len(label_stack) == 0: break
 				il.mark_label(label_stack.pop())
+				skip_to_close = False
 				continue
 
 			raise ValueError("Unimplemented esil {0} in {1} for {2}".format(token, esil, inst))
 
-		# Scan the function for loop instructions pointing to here
-		lbegin = None
-		with self._looplock:
-			n = addr + l
-			if n in self.loops:
-				lbegin = self.loops[n]
-		if lbegin is not None:
-			cond = il.compare_unsigned_greater_than(4, il.reg(4, "lcount"), il.const(4, 0))
-			f = force_label(n)
-			t = force_label(lbegin) #il.get_label_for_address(self, lbegin)
-
-			il.append(il.if_expr(cond, t, f))
-		return l
 
 
 class XtensaFunctionRecognizer(FunctionRecognizer):
@@ -372,7 +504,7 @@ class XtensaFunctionRecognizer(FunctionRecognizer):
 		first_inst = func.instructions.next()
 		res = first_inst[0][0].text == "entry"
 		if res:
-			func.name = "XTFUCN_{0:X}".format(first_inst[1])
+			func.name = "XTFUNC_{0:X}".format(first_inst[1])
 		return res
 
 # Note, these are the registers as seen by the callee
@@ -384,6 +516,6 @@ class XtensaWindowedCallingConvention(CallingConvention):
 
 XtensaLE.register()
 arch = Architecture["Xtensa LE"]
-arch.register_calling_convention(XtensaWindowedCallingConvention(arch, 'windowed'))
+#arch.register_calling_convention(XtensaWindowedCallingConvention(arch, 'windowed'))
 BinaryViewType['ELF'].register_arch(94, Endianness.LittleEndian, arch)
 XtensaFunctionRecognizer.register_arch(arch)
