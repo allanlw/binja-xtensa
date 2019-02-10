@@ -186,7 +186,8 @@ class XtensaLE(Architecture):
 #					il.append(il.set_reg(4, a(i-spilled_regs), r(i)))
 			if spilled_regs != 0:
 				il.append(il.set_reg(1, "PS.CALLINC", il.const(1, spilled_regs)))
-			il.append(il.set_reg(4, a(spilled_regs), il.const(4, addr + l)))
+			# return address
+#			il.append(il.set_reg(4, a(spilled_regs), il.const(4, addr + l)))
 			target = il.reg(4, args[0]) if inst.startswith("callx") else il.const(4, int(args[0], 16))
 			il.append(il.call(target))
 			# unspill from stack
