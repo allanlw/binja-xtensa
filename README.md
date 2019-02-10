@@ -38,3 +38,7 @@ Ninja](https://blog.ret2.io/2017/10/17/untangling-exotic-architectures-with-bina
 - [The Binary Ninja API documentation](https://api.binary.ninja/) is a must too.
 
 - The Binary Ninja slack is helpful for asking questions about the API.
+
+## License
+
+MIT. see LICENSE
