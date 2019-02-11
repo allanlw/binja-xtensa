@@ -8,9 +8,11 @@ from binaryninja.enums import LowLevelILOperation, LowLevelILFlagCondition, Inst
 from binaryninja.lowlevelil import LowLevelILLabel
 from binaryninja.functionrecognizer import FunctionRecognizer
 from binaryninja.callingconvention import CallingConvention
+from binascii import hexlify, unhexlify
 import binaryninja.log as log
 import r2pipe
 import threading
+import traceback
 from collections import namedtuple
 
 
@@ -505,6 +507,19 @@ class XtensaFunctionRecognizer(FunctionRecognizer):
 		res = first_inst[0][0].text == "entry"
 		if res:
 			func.name = "XTFUNC_{0:X}".format(first_inst[1])
+		# look for 0x36 (Entry instruction) immediately following the bottom of this function
+		try:
+			end = max(b.end for b in func.basic_blocks)
+			for i in range(4):
+				ei = end+i
+				b = data.read(ei, 1)
+				if b == '\x36':
+					if data.get_function_at(ei) is not None: break
+					data.add_function(ei)
+					break
+				if b != '\x00': break
+		except Exception as e:
+			log.log_error(traceback.format_exc())
 		return res
 
 # Note, these are the registers as seen by the callee
