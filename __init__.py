@@ -8,6 +8,8 @@ from binaryninja.enums import LowLevelILOperation, LowLevelILFlagCondition, Inst
 from binaryninja.lowlevelil import LowLevelILLabel
 from binaryninja.functionrecognizer import FunctionRecognizer
 from binaryninja.callingconvention import CallingConvention
+from binaryninja.plugin import PluginCommand
+from binaryninja import interaction
 from binascii import hexlify, unhexlify
 import binaryninja.log as log
 import r2pipe
@@ -15,6 +17,7 @@ import threading
 import traceback
 from collections import namedtuple
 
+LITBASE = 0x009f9000 + 0x40001
 
 # Helper function to make tokens easier to make
 def makeToken(tokenType, text, data=None):
@@ -171,10 +174,25 @@ class XtensaLE(Architecture):
 			res.add_branch(BranchType.TrueBranch, int(args[-1], 16))
 			res.add_branch(BranchType.FalseBranch, addr + res.length)
 		return res
+	def _decode_l32r(self, litbase, addr, bytes):
+		a, b, c = tuple(ord(x) for x in reversed(str(bytes[0:3])))
+		imm16 = (a << 8) + b
+		t = (c >> 4)
+		offset = (0x3FFF << 18) | (imm16 << 2)
+		if LITBASE & 0x1:
+			target = (LITBASE & 0xFFFFF000) + offset
+		else:
+			target = ((addr + 3) & 0xFFFFFFFC) + offset
+		target = target % (1 << 32)
+		return ("a{0}".format(t), target)
 	def get_instruction_text(self, data, addr):
 		inst,args = self._get_asm(data, addr)
 		if inst == "ill":
 			return None
+		# override buggy l32r in radare
+		if inst == "l32r" and LITBASE & 0x1 == 1:
+			a,b = self._decode_l32r(LITBASE, addr, data)
+			args[1] = hex(b)
 		tokens = []
 		tokens.append(makeToken("inst", inst))
 		tokens.append(makeToken("sep", " "))
@@ -205,7 +223,7 @@ class XtensaLE(Architecture):
 	def goto_or_jmp(self, il, a):
 		t = self.force_label(il, a)
 		if t is None:
-			il.append(il.jump(il.const(4, a)))
+			il.append(il.jump(il.const_pointer(4, a)))
 		else:
 			il.append(il.goto(t))
 
@@ -236,7 +254,7 @@ class XtensaLE(Architecture):
 				il.append(il.set_reg(1, "PS.CALLINC", il.const(1, spilled_regs)))
 			# return address
 #			il.append(il.set_reg(4, a(spilled_regs), il.const(4, addr + l)))
-			target = il.reg(4, args[0]) if inst.startswith("callx") else il.const(4, int(args[0], 16))
+			target = il.reg(4, args[0]) if inst.startswith("callx") else il.const_pointer(4, int(args[0], 16))
 			il.append(il.call(target))
 			# unspill from stack
 #			if spilled_regs != 0:
@@ -249,7 +267,7 @@ class XtensaLE(Architecture):
 			il.append(il.ret(il.reg(4, "a0")))
 			return l
 		elif inst == "j":
-			il.append(il.jump(il.const(4, int(args[0], 16))))
+			il.append(il.jump(il.const_pointer(4, int(args[0], 16))))
 			return l
 		elif inst in ("loopgtz", "loopnez", "loop"):
 			lbegin = addr + l
@@ -258,8 +276,8 @@ class XtensaLE(Architecture):
 			lcount = il.sub(4, r, il.const(4,1))
 			# lend must come before lbegin for loop detection to work lower down
 			if self.VERBOSE_IL:
-				il.append(il.set_reg(4, "lend", il.const(4, lend)))
-				il.append(il.set_reg(4, "lbegin", il.const(4, lbegin)))
+				il.append(il.set_reg(4, "lend", il.const_pointer(4, lend)))
+				il.append(il.set_reg(4, "lbegin", il.const_pointer(4, lbegin)))
 				il.append(il.set_reg(4, "lcount", lcount))
 			if inst in ("loopgtz", "loopnez"):
 				t = self.force_label(il, lbegin)
@@ -294,6 +312,12 @@ class XtensaLE(Architecture):
 		elif inst == "memw":
 			il.append(il.intrinsic([], "memw", []))
 			return l
+		# override buggy l32r in radare
+		elif inst == "l32r" and LITBASE & 0x1 == 1:
+			a,b = self._decode_l32r(LITBASE, addr, data)
+			il.append(il.set_reg(4, a, il.load(4, il.const_pointer(4, b))))
+			return l
+
 		esil = self._get_esil(data[0:l], addr)
 		if esil == "":
 			il.append(il.unimplemented())
@@ -341,7 +365,7 @@ class XtensaLE(Architecture):
 		def popr():
 			r = stack.pop()
 			if r == "pc":
-				return il.const(4, addr + l)
+				return il.const_pointer(4, addr + l)
 			return r
 		for i, token in enumerate(parts):
 			# No idea why I need this
@@ -349,7 +373,7 @@ class XtensaLE(Architecture):
 				break
 			if skip_to_close and token != "}": continue
 			if token == "$$":
-				stack.append(il.const(4, addr))
+				stack.append(il.const_pointer(4, addr))
 				continue
 			if token == "pc":
 				stack.append("pc")
@@ -405,7 +429,7 @@ class XtensaLE(Architecture):
 							offset = (256-offset) * -1
 						self.goto_or_jmp(il, offset + addr + 3)
 					else:
-						il.append(il.jump(il.add(4, il.const(4, addr + 3), src)))
+						il.append(il.jump(il.add(4, il.const_pointer(4, addr + 3), src)))
 					continue
 				dst = il[dste]
 				if dst.operation != LowLevelILOperation.LLIL_REG:
@@ -505,8 +529,8 @@ class XtensaFunctionRecognizer(FunctionRecognizer):
 	def recognize_low_level_il(self, data, func, il):
 		first_inst = func.instructions.next()
 		res = first_inst[0][0].text == "entry"
-		if res:
-			func.name = "XTFUNC_{0:X}".format(first_inst[1])
+		if res and not func.name.startswith("XTFUNC_"):
+			func.name = "XTFUNC_" + func.name
 		# look for 0x36 (Entry instruction) immediately following the bottom of this function
 		try:
 			end = max(b.end for b in func.basic_blocks)
@@ -527,6 +551,8 @@ class XtensaWindowedCallingConvention(CallingConvention):
 	int_arg_regs = ["a2", "a3", "a4", "a5", "a6", "a7", "PS.CALLINC"]
 	int_return_reg = "a2"
 	stack_adjusted_on_return = False
+
+
 
 
 XtensaLE.register()
